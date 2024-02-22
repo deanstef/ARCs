@@ -8,7 +8,7 @@ The example shows the entire workflow of authentication using a standalone Algor
 
 ## User registration
 
-Add registered users to the `server/mock/users.db.json` array. The `nonce` field must be left empty `''`.
+Add registered users to the `server/mock/users.db.ts` array. The `challenge` field must be left empty `''`.
 
 ## Run via Docker Compose
 
@@ -27,7 +27,7 @@ Visit `localhost`
 - `node.js`
 - `npm`
 
-From both `client`and `server` folders run
+From the root folder run:
 
 ```
 cp .env.example .env
@@ -36,3 +36,5 @@ npm run dev
 ```
 
 Visit `localhost:3001`
+
+> Reference implementation credits: [deanstef](https://github.com/deanstef) and [mrcointreau](https://github.com/mrcointreau)
