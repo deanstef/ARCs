@@ -1,0 +1,10 @@
+{
+  "type": "object",
+  "properties": {
+    "sampleValue": {
+      "type": "string",
+      "description": "sample value"
+    }
+  },
+  "required": ["sampleValue"]
+}

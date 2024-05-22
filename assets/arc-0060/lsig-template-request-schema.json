@@ -1,0 +1,76 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "http://arc60/lsig-schema.json",
+  "title": "Templated Logic Sig",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "LogicSignatureDescription": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "variables": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "variable": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string"
+              },
+              "description": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "variable",
+              "type",
+              "description"
+            ]
+          }
+        },
+        "program": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "description",
+        "variables",
+        "program"
+      ]
+    },
+    "hash": {
+      "type": "string"
+    },
+    "values": {
+      "type": "object",
+      "additionalProperties": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "number"
+          }
+        ]
+      }
+    }
+  },
+  "required": [
+    "LogicSignatureDescription",
+    "values",
+    "hash"
+  ]
+}
