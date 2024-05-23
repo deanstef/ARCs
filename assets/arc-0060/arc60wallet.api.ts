@@ -11,11 +11,9 @@ import * as crypto from 'crypto'
 import { readFileSync } from 'fs';
 import path from 'path';
 import Ajv, { JSONSchemaType } from 'ajv';
-import sha512, { sha512_256 } from 'js-sha512'
+import { sha512_256 } from 'js-sha512'
 import axios, { AxiosResponse } from 'axios'
-import * as util from 'util'
 import * as msgpack from "algo-msgpack-with-bigint"
-import { decode } from 'punycode';
 
 export interface ARC47LsigTemplateRequest {
     LogicSignatureDescription: {  // sha512_256 hash of this object is the template hash
@@ -36,10 +34,10 @@ export interface ARC47LsigTemplateRequest {
 }
 
 /**
- * 
+ *
  */
 export interface ARC31AuthRequest {
-     /** The domain name of the Verifier */
+    /** The domain name of the Verifier */
     domain: string;
     /** Algorand account to authenticate with*/
     authAcc: string;
@@ -53,7 +51,7 @@ export interface ARC31AuthRequest {
 
 export interface HDWalletMetadata {
     /**
-    * HD Wallet purpose value. First derivation path level. 
+    * HD Wallet purpose value. First derivation path level.
     * Hardened derivation is used.
     */
     purpose: number,
@@ -87,7 +85,8 @@ export interface HDWalletMetadata {
 export interface StdSigData {
     data: string;
     signer: Uint8Array;
-    hdPath?: HDWalletMetadata
+    hdPath?: HDWalletMetadata;
+    scope: ScopeType;
 }
 
 // ScopeType type
@@ -97,12 +96,6 @@ export enum ScopeType {
     MX_RANDOM = 1,
     ARC31 = 2,
     LSIG_TEMPLATE = 3
-}
-
-// StdSignMetadata type
-export interface StdSignMetadata {
-    scope: ScopeType;
-    encoding: string;
 }
 
 // StdSignature type 64 bytes array
@@ -117,16 +110,126 @@ export class SignDataError extends Error {
 // Error Codes & Messages
 export const ERROR_INVALID_SCOPE: SignDataError = new SignDataError(4600, 'Invalid Scope');
 export const ERROR_DOESNT_MATCH_SCHEMA: SignDataError = new SignDataError(4601, 'Doesn\'t match schema');
-export const ERROR_FAILED_DECODING: SignDataError = new SignDataError(4602, 'Failed decoding');
+export const ERROR_FAILED_PARSING: SignDataError = new SignDataError(4602, 'Failed parsing');
 export const ERROR_INVALID_SIGNER: SignDataError = new SignDataError(4603, 'Invalid Signer');
 export const ERROR_INVALID_HD_PATH: SignDataError = new SignDataError(4604, 'Invalid HD Path');
 export const ERROR_UNKNOWN: SignDataError = new SignDataError(4605, 'Unknown Error');
 export const ERROR_UNKNOWN_LSIG: SignDataError = new SignDataError(4606, 'Unknown LSIG');
 
+
+const CHALLENGE32_SCHEMA = {
+    parse: (data: string): any => {
+        return Buffer.from(data, "base64");
+    },
+    validate: (data: any): boolean => {
+        return data.length == 32 && data.slice(0, 7).toString() !== "Program";
+    },
+    serialize: (data: any): Promise<Uint8Array> => {
+        return Promise.resolve(data);
+    },
+}
+
+const MX_RANDOM_SCHEMA = {
+    parse: (data: string): any => {
+        return Buffer.from(data, "base64");
+    },
+    validate: (data: any): boolean => {
+        return data.length >= 2 && data[0] === 0x4D && data[1] === 0x58;
+    },
+    serialize: (data: any): Promise<Uint8Array> => {
+        return Promise.resolve(data);
+    },
+}
+
+const ARC31_SCHEMA = {
+    parse: (data: string): any => {
+        return JSON.parse(data);
+    },
+    validate: (data: any): boolean => {
+        const arc31SchemaStr = readFileSync(path.resolve(__dirname, 'arc31-request-schema.json'), 'utf8');
+        const arc31Schema: JSONSchemaType<any> = JSON.parse(arc31SchemaStr)
+
+        const ajv = new Ajv();
+        const validate = ajv.compile(arc31Schema)
+
+        if (!validate(data)) {
+            console.log(validate.errors)
+            return false
+        }
+
+        return true
+    },
+    serialize: (data: any): Promise<Uint8Array> => {
+        const bytes = msgpack.encode(data, { sortKeys: true, ignoreUndefined: true })
+        return Promise.resolve(bytes);
+    },
+}
+
+
+const ARC47_SCHEMA = {
+    parse: (data: string): any => {
+        return JSON.parse(data);
+    },
+    validate: (lsigData: any): boolean => {
+        // LSIG schema validation
+        // Wallets should load the LSIG Schema from their local storage at run-time.
+        const file_contents = readFileSync(path.resolve(__dirname, 'lsig-template-request-schema.json'), 'utf8');
+        const lsigSchema: JSONSchemaType<any> = JSON.parse(file_contents)
+
+        const ajv = new Ajv();
+        const validate = ajv.compile(lsigSchema)
+
+        if (!validate(lsigData)) {
+            return false;
+        }
+
+        // hash lsig template request by excluding values
+        const hashTemplate: string = sha512_256.update(JSON.stringify(lsigData.LogicSignatureDescription)).hex()
+
+        // check if hash is one of the known hashes
+        if (!Arc60WalletApi.known_lsigs_template_hashes.includes(hashTemplate)) {
+            throw ERROR_UNKNOWN_LSIG;
+        }
+
+        return true;
+    },
+    serialize: async (lsigData: any): Promise<Uint8Array> => {
+        // replaces values
+        let finalTeal = atob(lsigData.LogicSignatureDescription.program)
+
+        // get values
+        const values = lsigData.values
+
+        // get keys
+        const keys = Object.keys(values)
+
+        // loop through keys
+        for (const key of keys) {
+            finalTeal = finalTeal.replaceAll(key, values[key as keyof typeof values].toString())
+        }
+
+        // No standalone compiler :(
+        // Submit to node to compile
+        const result: AxiosResponse = await axios.post('https://testnet-api.algonode.cloud:443/v2/teal/compile',
+            Buffer.from(finalTeal), {
+            headers: {
+                "Content-Type": "application/x-binary",
+                "X-Algo-API-Token": "a".repeat(64)
+            }
+        })
+
+        const compiled: Buffer = Buffer.from(result.data.result, 'base64')
+
+        // concat with tag
+        return new Uint8Array(Buffer.concat([Buffer.from("Program"), compiled]))
+    },
+}
+
+
 export class Arc60WalletApi {
 
     /**
-     * Known LSIG template hashes. 
+     * Known LSIG template hashes.
      */
     static known_lsigs_template_hashes: string[] = [
         "e796a2725dc97b2ed714a7363ba950e3633be759244e99624e63a6a57cdc0db5"
@@ -134,170 +237,73 @@ export class Arc60WalletApi {
 
     /**
      * Constructor for Arc60WalletApi
-     * 
+     *
      * @param k - is the seed value as part of Ed25519 key generation.
-     * 
-     * The following link has a visual explanation of the key gen and signing process: 
-     * 
+     *
+     * The following link has a visual explanation of the key gen and signing process:
+     *
      * https://private-user-images.githubusercontent.com/1436105/316953159-aba6b82f-b558-41b9-abcb-57f682026f96.png?jwt=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3MTU4Mzk0MjMsIm5iZiI6MTcxNTgzOTEyMywicGF0aCI6Ii8xNDM2MTA1LzMxNjk1MzE1OS1hYmE2YjgyZi1iNTU4LTQxYjktYWJjYi01N2Y2ODIwMjZmOTYucG5nP1gtQW16LUFsZ29yaXRobT1BV1M0LUhNQUMtU0hBMjU2JlgtQW16LUNyZWRlbnRpYWw9QUtJQVZDT0RZTFNBNTNQUUs0WkElMkYyMDI0MDUxNiUyRnVzLWVhc3QtMSUyRnMzJTJGYXdzNF9yZXF1ZXN0JlgtQW16LURhdGU9MjAyNDA1MTZUMDU1ODQzWiZYLUFtei1FeHBpcmVzPTMwMCZYLUFtei1TaWduYXR1cmU9NjE3NGUxMDkzMzkxY2RkMzU3OTVhOWY0MzJkNzBmOGJhN2JlNDY4OTQzYzBjY2QwNzEyOTg1NzcwNDAzM2EzMSZYLUFtei1TaWduZWRIZWFkZXJzPWhvc3QmYWN0b3JfaWQ9MCZrZXlfaWQ9MCZyZXBvX2lkPTAifQ.YBMeEI0SRaxjeRRZRiZi0_58wEeCk0hgl5gIyPXluas
-     * 
+     *
      */
     constructor(private readonly k: Uint8Array) {
         this.k = k;
     }
 
     /**
-     * Arbitrary data signing function. 
+     * Arbitrary data signing function.
      * Based on the provided scope and encoding, it decodes the data and signs it.
-     * 
-     * 
+     *
+     *
      * @param signingData - includes the data to be signed and the signer's public key
      * @param metadata - includes the scope and encoding of the data
      * @returns - signature of the data from the signer.
-     * 
+     *
      * @throws - Error 4600 - Invalid Scope - if the scope is not supported
      * @throws - Error 4601 - DOesn't match schema - The data doesn't match the schema for the scope
      * @throws - Error 4602 - Failed decoding - if the data can't be decoded
      * @throws - Error 4603 - Invalid Signer - if the signer is not a valid public key
      * @throws - Error 4604 - Invalid HD Path - if the HD path is invalid
      */
-    async signData(signingData: StdSigData, metadata: StdSignMetadata): Promise<StdSignature> {
+    async signData(signingData: StdSigData): Promise<StdSignature> {
         // decode signing data with chosen metadata.encoding
-        let decodedData: Uint8Array
         let toSign: Uint8Array
 
         // check signer
-        if (!Arc60WalletApi.isEqual(signingData.signer,(await Arc60WalletApi.getPublicKey(this.k)))) {
+        if (!Arc60WalletApi.isEqual(signingData.signer, (await Arc60WalletApi.getPublicKey(this.k)))) {
             throw ERROR_INVALID_SIGNER;
         }
 
-        // decode data
-        switch(metadata.encoding) {
-            case 'base64':
-                decodedData = Buffer.from(signingData.data, 'base64');
-                break;
-            case 'hex':
-                decodedData = Buffer.from(signingData.data, 'hex');
-                break;
-            default:
-                throw ERROR_FAILED_DECODING;
-        }
-
-        // Reject if Program bytes prefix is present in byte array
-        if(decodedData.slice(0, 7).toString() === "Program") {
-            throw ERROR_DOESNT_MATCH_SCHEMA;
-        }
-        
-        // validate against schema
-        switch(metadata.scope) {
+        let schema = null;
+        switch (signingData.scope) {
             case ScopeType.CHALLENGE32:
-                if(decodedData.length !== 32) {
-                    throw ERROR_DOESNT_MATCH_SCHEMA;
-                }
-
-                toSign = decodedData;
+                schema = CHALLENGE32_SCHEMA;
                 break;
             case ScopeType.MX_RANDOM:
-                // Check MX prefix
-                if(decodedData[0] !== 0x6D || decodedData[1] !== 0x78) {
-                    throw ERROR_DOESNT_MATCH_SCHEMA;
-                }
-
-                toSign = decodedData
+                schema = MX_RANDOM_SCHEMA;
                 break;
-
             case ScopeType.ARC31:
-                const arc31MsgObj: ARC31AuthRequest = JSON.parse(decodedData.toString())
-                const isArc31Valid = await this.isArc31RequestValid(arc31MsgObj)
-                if(!isArc31Valid) {
-                    throw ERROR_DOESNT_MATCH_SCHEMA;
-                }
-
-                // msgpack encode
-                const msgpackEncoded = msgpack.encode(JSON.parse(decodedData.toString()), { sortKeys: true, ignoreUndefined: true })
-
-                // sign the data
-                toSign = msgpackEncoded;
+                schema = ARC31_SCHEMA;
                 break;
-
             case ScopeType.LSIG_TEMPLATE:
-                // LSIG schema validation
-                // Wallets should load the LSIG Schema from their local storage at run-time. 
-                const file_contents = readFileSync(path.resolve(__dirname, 'lsig-template-request-schema.json'), 'utf8');
-                const lsigSchema: JSONSchemaType<any> = JSON.parse(file_contents)
-                
-                const ajv = new Ajv();
-                const validate = ajv.compile(lsigSchema)
-
-                const lsigData = JSON.parse(decodedData.toString());
-
-                if(!validate(lsigData)) {
-                    throw ERROR_DOESNT_MATCH_SCHEMA;
-                }
-
-                // hash lsig template request by excluding values
-                const hashTemplate: string = sha512_256.update(JSON.stringify(lsigData.LogicSignatureDescription)).hex()
-
-                // check if hash is one of the known hashes
-                if(!Arc60WalletApi.known_lsigs_template_hashes.includes(hashTemplate)) {
-                    throw ERROR_UNKNOWN_LSIG;
-                }
-
-                // replaces values
-                let finalTeal = atob(lsigData.LogicSignatureDescription.program)
-
-                // get values
-                const values = lsigData.values
-    
-                // get keys
-                const keys = Object.keys(values)
-                
-                // loop through keys
-                for (const key of keys) {
-                    finalTeal = finalTeal.replaceAll(key, values[key as keyof typeof values].toString())
-                }
-                
-                // No standalone compiler :(
-                // Submit to node to compile 
-                const result: AxiosResponse = await axios.post('https://testnet-api.algonode.cloud:443/v2/teal/compile',
-                    Buffer.from(finalTeal), {
-                    headers: {
-                        "Content-Type": "application/x-binary",
-                        "X-Algo-API-Token": "a".repeat(64)
-                    }
-                })
-
-                const compiled: Buffer = Buffer.from(result.data.result, 'base64')
-
-                // concat with tag
-                toSign = new Uint8Array(Buffer.concat([Buffer.from("Program"), compiled]))
+                schema = ARC47_SCHEMA;
                 break;
             default:
                 throw ERROR_INVALID_SCOPE;
         }
 
-        // perform signature using libsodium
-        return await this.rawSign(this.k, toSign);
-    }
-
-    /**
-     * 
-     * @param arch31Req 
-     * @returns 
-     */
-    private async isArc31RequestValid(arch31Req: ARC31AuthRequest): Promise<boolean> {
-        const arc31SchemaStr = readFileSync(path.resolve(__dirname, 'arc31-request-schema.json'), 'utf8');
-        const arc31Schema: JSONSchemaType<any> = JSON.parse(arc31SchemaStr)
-        
-        const ajv = new Ajv();
-        const validate = ajv.compile(arc31Schema)
-
-        if(!validate(arch31Req)) {
-            console.log(validate.errors)
-            return false
+        let decodedValue;
+        try {
+            decodedValue = schema.parse(signingData.data)
+        } catch {
+            throw ERROR_FAILED_PARSING;
         }
 
-        return true
+        if (!schema.validate(decodedValue)) {
+            throw ERROR_DOESNT_MATCH_SCHEMA;
+        }
+
+        toSign = await schema.serialize(decodedValue);
+        return await this.rawSign(this.k, toSign);
     }
 
     /**
@@ -352,13 +358,13 @@ export class Arc60WalletApi {
 
     private static isEqual(a: Uint8Array, b: Uint8Array): boolean {
         if (a.byteLength !== b.byteLength) {
-          return false;
+            return false;
         }
         return a.every((value, index) => value === b[index]);
-      }
+    }
 
     /**
-     * 
+     *
      * @param k - seed
      * @returns - public key
      */
